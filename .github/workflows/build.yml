@@ -1,0 +1,464 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.filesplitter"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.filesplitter"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+          }
+          __EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:largeHeap="true"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          __EOF__
+          mkdir -p app/src/main/java/com/example/filesplitter
+          cat > app/src/main/java/com/example/filesplitter/FileOps.kt <<'__EOF__'
+          package com.example.filesplitter
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.net.Uri
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import java.io.OutputStream
+
+          object FileOps {
+
+              const val OUT_DIR = "FileSplitter"
+
+              // ---------- معلومات الملف ----------
+
+              fun displayName(ctx: Context, uri: Uri): String {
+                  ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (i >= 0 && c.moveToFirst()) return c.getString(i) ?: "file"
+                  }
+                  return "file"
+              }
+
+              fun size(ctx: Context, uri: Uri): Long {
+                  ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.SIZE)
+                      if (i >= 0 && c.moveToFirst() && !c.isNull(i)) return c.getLong(i)
+                  }
+                  return 0L
+              }
+
+              fun human(bytes: Long): String {
+                  if (bytes < 1024) return "$bytes B"
+                  val kb = bytes / 1024.0
+                  if (kb < 1024) return String.format("%.1f KB", kb)
+                  val mb = kb / 1024.0
+                  if (mb < 1024) return String.format("%.1f MB", mb)
+                  return String.format("%.2f GB", mb / 1024.0)
+              }
+
+              // ---------- إنشاء ملف ناتج في Downloads/FileSplitter ----------
+
+              private fun createOut(ctx: Context, name: String, mime: String): OutputStream {
+                  val values = ContentValues().apply {
+                      put(MediaStore.Downloads.DISPLAY_NAME, name)
+                      put(MediaStore.Downloads.MIME_TYPE, mime)
+                      put(
+                          MediaStore.Downloads.RELATIVE_PATH,
+                          Environment.DIRECTORY_DOWNLOADS + "/" + OUT_DIR
+                      )
+                  }
+                  val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                      ?: throw IllegalStateException("تعذر إنشاء الملف الناتج")
+                  return ctx.contentResolver.openOutputStream(uri)
+                      ?: throw IllegalStateException("تعذر الكتابة في الملف الناتج")
+              }
+
+              // ---------- تقسيم أي ملف ----------
+
+              /**
+               * byParts = true  -> value = عدد الأجزاء
+               * byParts = false -> value = حجم الجزء بالميجابايت
+               * يرجع عدد الأجزاء الناتجة.
+               */
+              fun splitFile(
+                  ctx: Context,
+                  uri: Uri,
+                  byParts: Boolean,
+                  value: Long,
+                  onProgress: (Float) -> Unit
+              ): Int {
+                  if (value <= 0) throw IllegalArgumentException("القيمة لازم تكون أكبر من صفر")
+                  val total = size(ctx, uri)
+                  if (total <= 0) throw IllegalArgumentException("الملف فاضي أو حجمه غير معروف")
+
+                  val partSize = if (byParts) (total + value - 1) / value else value * 1024L * 1024L
+                  val parts = ((total + partSize - 1) / partSize).toInt()
+                  if (parts < 2) throw IllegalArgumentException("حجم الجزء أكبر من الملف نفسه، اختار قيمة أصغر")
+
+                  val base = displayName(ctx, uri)
+                  val buf = ByteArray(64 * 1024)
+                  var done = 0L
+
+                  ctx.contentResolver.openInputStream(uri)?.use { input ->
+                      for (p in 1..parts) {
+                          var remaining = minOf(partSize, total - (p - 1) * partSize)
+                          val name = base + ".part" + String.format("%03d", p)
+                          createOut(ctx, name, "application/octet-stream").use { out ->
+                              while (remaining > 0) {
+                                  val want = minOf(buf.size.toLong(), remaining).toInt()
+                                  val n = input.read(buf, 0, want)
+                                  if (n < 0) break
+                                  out.write(buf, 0, n)
+                                  remaining -= n
+                                  done += n
+                                  onProgress(done.toFloat() / total)
+                              }
+                          }
+                      }
+                  } ?: throw IllegalStateException("تعذر فتح الملف")
+                  return parts
+              }
+
+              // ---------- دمج الأجزاء ----------
+
+              /** يرجع اسم الملف الناتج. */
+              fun mergeFiles(ctx: Context, uris: List<Uri>, onProgress: (Float) -> Unit): String {
+                  if (uris.size < 2) throw IllegalArgumentException("اختار ملفين على الأقل")
+                  val sorted = uris.sortedBy { displayName(ctx, it).lowercase() }
+                  val first = displayName(ctx, sorted.first())
+                  val outName = Regex("\\.part\\d+$", RegexOption.IGNORE_CASE).replace(first, "")
+                      .let { if (it == first) "merged_$first" else it }
+
+                  val total = sorted.sumOf { size(ctx, it) }.coerceAtLeast(1L)
+                  val buf = ByteArray(64 * 1024)
+                  var done = 0L
+
+                  createOut(ctx, outName, "application/octet-stream").use { out ->
+                      for (u in sorted) {
+                          ctx.contentResolver.openInputStream(u)?.use { input ->
+                              while (true) {
+                                  val n = input.read(buf)
+                                  if (n < 0) break
+                                  out.write(buf, 0, n)
+                                  done += n
+                                  onProgress(done.toFloat() / total)
+                              }
+                          } ?: throw IllegalStateException("تعذر فتح: " + displayName(ctx, u))
+                      }
+                  }
+                  return outName
+              }
+
+              // ---------- PDF ----------
+
+              fun pdfPageCount(ctx: Context, uri: Uri): Int {
+                  val input = ctx.contentResolver.openInputStream(uri)
+                      ?: throw IllegalStateException("تعذر فتح الـ PDF")
+                  return input.use { stream ->
+                      PDDocument.load(stream).use { doc -> doc.numberOfPages }
+                  }
+              }
+
+              private fun normalizeDigits(s: String): String {
+                  val sb = StringBuilder()
+                  for (ch in s) {
+                      when (ch) {
+                          in '٠'..'٩' -> sb.append('0' + (ch - '٠'))
+                          in '۰'..'۹' -> sb.append('0' + (ch - '۰'))
+                          '،', '؛', ';' -> sb.append(',')
+                          '–', '—', '−' -> sb.append('-')
+                          ' ' -> {}
+                          else -> sb.append(ch)
+                      }
+                  }
+                  return sb.toString()
+              }
+
+              /** مثال: "1-3,5,7-9" */
+              fun parseRanges(spec: String, pageCount: Int): List<IntRange> {
+                  val clean = normalizeDigits(spec)
+                  if (clean.isEmpty()) throw IllegalArgumentException("اكتب أرقام الصفحات، مثال: 1-3,5,7-9")
+                  val result = mutableListOf<IntRange>()
+                  for (piece in clean.split(',').filter { it.isNotEmpty() }) {
+                      val nums = piece.split('-')
+                      val a = nums[0].toIntOrNull()
+                      val b = if (nums.size == 1) a else nums.getOrNull(1)?.toIntOrNull()
+                      if (a == null || b == null || nums.size > 2) {
+                          throw IllegalArgumentException("صيغة غير صحيحة: $piece")
+                      }
+                      if (a < 1 || b > pageCount || a > b) {
+                          throw IllegalArgumentException("النطاق $piece خارج حدود الملف (عدد الصفحات $pageCount)")
+                      }
+                      result.add(a..b)
+                  }
+                  return result
+              }
+
+              /** يرجع عدد ملفات الـ PDF الناتجة. */
+              fun splitPdf(
+                  ctx: Context,
+                  uri: Uri,
+                  eachPage: Boolean,
+                  spec: String,
+                  onProgress: (Float) -> Unit
+              ): Int {
+                  val base = displayName(ctx, uri).removeSuffix(".pdf").removeSuffix(".PDF")
+                  val input = ctx.contentResolver.openInputStream(uri)
+                      ?: throw IllegalStateException("تعذر فتح الـ PDF")
+                  return input.use { stream ->
+                      PDDocument.load(stream).use { src ->
+                          val n = src.numberOfPages
+                          val ranges = if (eachPage) (1..n).map { p -> p..p } else parseRanges(spec, n)
+                          ranges.forEachIndexed { idx, r ->
+                              PDDocument().use { outDoc ->
+                                  for (p in r) outDoc.importPage(src.getPage(p - 1))
+                                  val name = if (r.first == r.last) {
+                                      base + "_p" + r.first + ".pdf"
+                                  } else {
+                                      base + "_p" + r.first + "-" + r.last + ".pdf"
+                                  }
+                                  createOut(ctx, name, "application/pdf").use { os -> outDoc.save(os) }
+                              }
+                              onProgress((idx + 1).toFloat() / ranges.size)
+                          }
+                          ranges.size
+                      }
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/example/filesplitter
+          cat > app/src/main/java/com/example/filesplitter/MainActivity.kt <<'__EOF__'
+          package com.example.filesplitter
+
+          import android.net.Uri
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.ColumnScope
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.NavigationBar
+          import androidx.compose.material3.NavigationBarItem
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.CompositionLocalProvider
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalLayoutDirection
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.LayoutDirection
+          import androidx.compose.ui.unit.dp
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  PDFBoxResourceLoader.init(applicationContext)
+                  setContent {
+                      CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                          MaterialTheme {
+                              Surface(modifier = Modifier.fillMaxSize()) {
+                                  AppRoot()
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------
+          // الهيكل العام
+          // ------------------------------------------------------------------
+
+          @Composable
+          fun AppRoot() {
+              var tab by remember { mutableIntStateOf(0) }
+              val icons = listOf("✂", "🔗", "📄")
+              val labels = listOf("تقسيم", "دمج", "PDF")
+
+              Scaffold(
+                  bottomBar = {
+                      NavigationBar {
+                          for (i in labels.indices) {
+                              NavigationBarItem(
+                                  selected = tab == i,
+                                  onClick = { tab = i },
+                                  icon = { Text(icons[i]) },
+                                  label = { Text(labels[i]) }
+                              )
+                          }
+                      }
+                  }
+              ) { pad ->
+                  Box(modifier = Modifier.padding(pad).fillMaxSize()) {
+                      when (tab) {
+                          0 -> SplitScreen()
+                          1 -> MergeScreen()
+                          else -> PdfScreen()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun ScreenColumn(title: String, content: @Composable ColumnScope.() -> Unit) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp)
+              ) {
+                  Text(title, style = MaterialTheme.typography.headlineSmall)
+                  content()
+              }
+          }
+
+          @Composable
+          private fun Choice(selected: Boolean, label: String, onClick: () -> Unit) {
+              if (selected) {
+                  Button(onClick = onClick) { Text(label) }
+              } else {
+                  OutlinedButton(onClick = onClick) { Text(label) }
+              }
+          }
+
+          @Composable
+          private fun StatusArea(busy: Boolean, progress: Float, msg: String?) {
+              if (busy) {
+                  LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+              }
+              if (msg != null) {
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Text(msg, modifier = Modifier.padding(12.dp))
+                  }
+              }
+          }
+
+          private fun launchTask(
+              scope: CoroutineScope,
+              setBusy: (Boolean) -> Unit,
+              setMsg: (String?) -> Unit,
+              work: () -> String
+          ) {
+              scope.launch {
+                  setBusy(true)
+                  setMsg(null)
+                  val result = try {
+                      withContext(Dispatchers.IO) {
